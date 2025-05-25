@@ -248,11 +248,11 @@ class IndexingService:
         return abs(hash(term.lower())) % total_typeahead_shards
     
     def _update_typeahead_terms(self, terms: List[str]):
-        """Update typeahead service with new terms"""
+        """Update typeahead service with new terms (Redis-first approach)"""
         if not terms:
             return
         
-        # Group terms by typeahead shard
+        # Group terms by typeahead shard and count frequencies
         shard_terms = {}
         for term in terms:
             shard_id = self._get_shard_for_term(term)
@@ -260,19 +260,39 @@ class IndexingService:
                 shard_terms[shard_id] = Counter()
             shard_terms[shard_id][term] += 1
         
-        # Send updates to typeahead services
+        # Update Redis directly for each shard (no locks, atomic operations)
         for shard_id, term_counts in shard_terms.items():
             try:
-                # Send via Kafka for async processing
-                if self.kafka_producer:
-                    message = {
-                        'action': 'update_terms',
-                        'shard_id': shard_id,
-                        'terms': dict(term_counts)
-                    }
-                    self.kafka_producer.send('typeahead_updates', value=message)
+                # Use Redis atomic operations instead of database writes
+                redis_key_prefix = f"terms:shard:{shard_id}"
+                
+                # Batch update Redis using pipeline for better performance
+                pipe = redis_client.pipeline()
+                for term, count in term_counts.items():
+                    redis_key = f"{redis_key_prefix}:{term.lower().strip()}"
+                    pipe.incr(redis_key, count)
+                    pipe.expire(redis_key, 86400)  # 24 hour expiration
+                
+                # Execute all Redis operations atomically
+                pipe.execute()
+                
+                logger.debug(f"Updated {len(term_counts)} terms in Redis for shard {shard_id}")
+                
             except Exception as e:
-                logger.error(f"Error updating typeahead terms: {e}")
+                logger.error(f"Error updating Redis terms for shard {shard_id}: {e}")
+                
+                # Fallback to Kafka if Redis fails
+                try:
+                    if self.kafka_producer:
+                        message = {
+                            'action': 'update_terms',
+                            'shard_id': shard_id,
+                            'terms': dict(term_counts)
+                        }
+                        self.kafka_producer.send('typeahead_updates', value=message)
+                        logger.info(f"Sent terms to Kafka as fallback for shard {shard_id}")
+                except Exception as kafka_error:
+                    logger.error(f"Both Redis and Kafka failed for shard {shard_id}: {kafka_error}")
     
     def index_document(self, doc_data: Dict[str, Any]) -> Dict[str, Any]:
         """Index a single document"""

@@ -3,6 +3,7 @@ import json
 import pickle
 import time
 import logging
+import threading
 from typing import Dict, List, Tuple, Any
 import psycopg2
 import redis
@@ -161,12 +162,146 @@ class PrefixTrie:
         )
         return sorted_terms[:limit]
 
+class RedisTermManager:
+    """Manages term frequencies in Redis with periodic PostgreSQL dumps"""
+    
+    def __init__(self, redis_client, shard_id: int):
+        self.redis_client = redis_client
+        self.shard_id = shard_id
+        self.redis_key_prefix = f"terms:shard:{shard_id}"
+        self.dump_interval = 30  # seconds
+        self.last_dump = time.time()
+        self.dump_lock = threading.Lock()
+        
+        # Start background dump thread
+        self.dump_thread = threading.Thread(target=self._periodic_dump, daemon=True)
+        self.dump_thread.start()
+    
+    def get_redis_key(self, term: str) -> str:
+        """Get Redis key for a term"""
+        return f"{self.redis_key_prefix}:{term}"
+    
+    def increment_term(self, term: str, delta: int = 1) -> int:
+        """Increment term frequency in Redis (atomic operation)"""
+        if not term:
+            return 0
+        
+        term = term.lower().strip()
+        if not term:
+            return 0
+        
+        try:
+            key = self.get_redis_key(term)
+            new_freq = self.redis_client.incr(key, delta)
+            
+            # Set expiration for cleanup (24 hours)
+            if new_freq == delta:  # First time setting this key
+                self.redis_client.expire(key, 86400)
+            
+            return max(0, new_freq)
+        except Exception as e:
+            logger.error(f"Error incrementing term in Redis: {e}")
+            return 0
+    
+    def get_term_frequency(self, term: str) -> int:
+        """Get term frequency from Redis"""
+        if not term:
+            return 0
+        
+        term = term.lower().strip()
+        try:
+            key = self.get_redis_key(term)
+            freq = self.redis_client.get(key)
+            return int(freq) if freq else 0
+        except Exception as e:
+            logger.error(f"Error getting term frequency from Redis: {e}")
+            return 0
+    
+    def get_all_terms(self) -> Dict[str, int]:
+        """Get all terms for this shard from Redis"""
+        try:
+            pattern = f"{self.redis_key_prefix}:*"
+            terms = {}
+            
+            for key in self.redis_client.scan_iter(match=pattern):
+                term = key.decode('utf-8').split(':', 3)[-1]  # Extract term from key
+                freq = self.redis_client.get(key)
+                if freq:
+                    terms[term] = int(freq)
+            
+            return terms
+        except Exception as e:
+            logger.error(f"Error getting all terms from Redis: {e}")
+            return {}
+    
+    def _periodic_dump(self):
+        """Background thread that periodically dumps Redis data to PostgreSQL"""
+        while True:
+            try:
+                time.sleep(self.dump_interval)
+                self.dump_to_postgres()
+            except Exception as e:
+                logger.error(f"Error in periodic dump: {e}")
+    
+    def dump_to_postgres(self):
+        """Dump Redis term frequencies to PostgreSQL"""
+        with self.dump_lock:
+            try:
+                # Get all terms from Redis
+                redis_terms = self.get_all_terms()
+                if not redis_terms:
+                    return
+                
+                # Connect to PostgreSQL
+                conn = psycopg2.connect(POSTGRES_URL)
+                cursor = conn.cursor()
+                
+                # Update PostgreSQL with Redis data
+                updated_count = 0
+                inserted_count = 0
+                
+                for term, frequency in redis_terms.items():
+                    if frequency <= 0:
+                        # Delete terms with zero or negative frequency
+                        cursor.execute(
+                            "DELETE FROM terms WHERE term = %s AND shard_id = %s",
+                            (term, self.shard_id)
+                        )
+                    else:
+                        # Upsert term frequency
+                        cursor.execute("""
+                            INSERT INTO terms (term, frequency, shard_id, updated_at)
+                            VALUES (%s, %s, %s, CURRENT_TIMESTAMP)
+                            ON CONFLICT (term, shard_id)
+                            DO UPDATE SET 
+                                frequency = %s,
+                                updated_at = CURRENT_TIMESTAMP
+                        """, (term, frequency, self.shard_id, frequency))
+                        
+                        if cursor.rowcount == 1:
+                            inserted_count += 1
+                        else:
+                            updated_count += 1
+                
+                conn.commit()
+                conn.close()
+                
+                logger.info(f"Dumped to PostgreSQL: {inserted_count} inserted, {updated_count} updated")
+                
+            except Exception as e:
+                logger.error(f"Error dumping to PostgreSQL: {e}")
+
 class TypeaheadService:
     def __init__(self):
         self.trie = PrefixTrie(TRIE_PATH)
+        self.redis_manager = RedisTermManager(redis_client, SHARD_ID)
         self.db_connection = None
         self._connect_db()
         self._load_terms_from_db()
+        
+        # Start background trie update thread
+        self.trie_update_thread = threading.Thread(target=self._periodic_trie_update, daemon=True)
+        self.trie_update_thread.start()
     
     def _connect_db(self):
         """Connect to PostgreSQL database"""
@@ -207,6 +342,33 @@ class TypeaheadService:
         except Exception as e:
             logger.error(f"Error loading terms from database: {e}")
     
+    def _periodic_trie_update(self):
+        """Periodically update trie with Redis data"""
+        while True:
+            try:
+                time.sleep(60)  # Update trie every minute
+                self._update_trie_from_redis()
+            except Exception as e:
+                logger.error(f"Error in periodic trie update: {e}")
+    
+    def _update_trie_from_redis(self):
+        """Update trie with latest data from Redis"""
+        try:
+            redis_terms = self.redis_manager.get_all_terms()
+            
+            # Update trie with Redis data
+            for term, frequency in redis_terms.items():
+                if frequency > 0:
+                    self.trie.insert(term, frequency - self.trie.term_frequencies.get(term, 0))
+                else:
+                    self.trie.remove(term)
+            
+            # Save updated trie
+            self.trie.save_trie()
+            
+        except Exception as e:
+            logger.error(f"Error updating trie from Redis: {e}")
+    
     def get_suggestions(self, prefix: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Get typeahead suggestions for a prefix"""
         if not prefix or len(prefix) < 1:
@@ -219,7 +381,7 @@ class TypeaheadService:
         return [{"term": term, "frequency": freq} for term, freq in suggestions]
     
     def add_term(self, term: str, frequency: int = 1):
-        """Add or update a term"""
+        """Add or update a term (Redis-first approach)"""
         if not term:
             return False
         
@@ -228,19 +390,12 @@ class TypeaheadService:
             return False
         
         try:
-            # Update trie
+            # Update Redis immediately (atomic, no locks)
+            new_freq = self.redis_manager.increment_term(term, frequency)
+            
+            # Update local trie for immediate search availability
             self.trie.insert(term, frequency)
             
-            # Update database
-            cursor = self._get_db_cursor()
-            cursor.execute("""
-                INSERT INTO terms (term, frequency, shard_id) 
-                VALUES (%s, %s, %s)
-                ON CONFLICT (term, shard_id) 
-                DO UPDATE SET frequency = terms.frequency + %s
-            """, (term, frequency, SHARD_ID, frequency))
-            
-            self.db_connection.commit()
             return True
             
         except Exception as e:
@@ -248,7 +403,7 @@ class TypeaheadService:
             return False
     
     def remove_term(self, term: str):
-        """Remove a term"""
+        """Remove a term (Redis-first approach)"""
         if not term:
             return False
         
@@ -257,17 +412,12 @@ class TypeaheadService:
             return False
         
         try:
-            # Remove from trie
+            # Set frequency to 0 in Redis (will be deleted during next dump)
+            self.redis_manager.redis_client.set(self.redis_manager.get_redis_key(term), 0)
+            
+            # Remove from local trie
             self.trie.remove(term)
             
-            # Remove from database
-            cursor = self._get_db_cursor()
-            cursor.execute(
-                "DELETE FROM terms WHERE term = %s AND shard_id = %s",
-                (term, SHARD_ID)
-            )
-            
-            self.db_connection.commit()
             return True
             
         except Exception as e:
@@ -275,7 +425,7 @@ class TypeaheadService:
             return False
     
     def update_term_frequency(self, term: str, frequency_delta: int):
-        """Update term frequency"""
+        """Update term frequency (Redis-first approach)"""
         if not term:
             return False
         
@@ -284,24 +434,14 @@ class TypeaheadService:
             return False
         
         try:
-            # Update trie
-            current_freq = self.trie.term_frequencies.get(term, 0)
-            new_freq = max(0, current_freq + frequency_delta)
+            # Update Redis immediately
+            new_freq = self.redis_manager.increment_term(term, frequency_delta)
             
-            if new_freq == 0:
-                self.remove_term(term)
+            # Update local trie
+            if new_freq <= 0:
+                self.trie.remove(term)
             else:
-                self.trie.insert(term, new_freq - current_freq)
-                
-                # Update database
-                cursor = self._get_db_cursor()
-                cursor.execute("""
-                    UPDATE terms 
-                    SET frequency = %s 
-                    WHERE term = %s AND shard_id = %s
-                """, (new_freq, term, SHARD_ID))
-                
-                self.db_connection.commit()
+                self.trie.insert(term, frequency_delta)
             
             return True
             
@@ -317,6 +457,9 @@ class TypeaheadService:
             
             # Reload from database
             self._load_terms_from_db()
+            
+            # Update with Redis data
+            self._update_trie_from_redis()
             
             # Save trie
             self.trie.save_trie()
@@ -468,6 +611,41 @@ def save_trie():
     try:
         typeahead_service.trie.save_trie()
         return jsonify({"message": "Trie saved successfully", "shard_id": SHARD_ID})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/redis-stats')
+def redis_stats():
+    """Get Redis statistics and sync status"""
+    try:
+        redis_terms = typeahead_service.redis_manager.get_all_terms()
+        
+        # Get database term count for comparison
+        cursor = typeahead_service._get_db_cursor()
+        cursor.execute("SELECT COUNT(*) FROM terms WHERE shard_id = %s", (SHARD_ID,))
+        db_count = cursor.fetchone()[0]
+        
+        return jsonify({
+            "shard_id": SHARD_ID,
+            "redis_terms_count": len(redis_terms),
+            "database_terms_count": db_count,
+            "sync_interval_seconds": typeahead_service.redis_manager.dump_interval,
+            "top_redis_terms": sorted(redis_terms.items(), key=lambda x: x[1], reverse=True)[:10],
+            "redis_connected": redis_client.ping()
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/force-sync', methods=['POST'])
+def force_sync():
+    """Force immediate Redis to PostgreSQL sync"""
+    try:
+        typeahead_service.redis_manager.dump_to_postgres()
+        return jsonify({
+            "message": "Sync completed successfully",
+            "shard_id": SHARD_ID,
+            "timestamp": time.time()
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
