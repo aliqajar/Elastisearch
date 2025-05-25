@@ -1,0 +1,7 @@
+flask==2.3.3
+psycopg2-binary==2.9.7
+redis==5.0.1
+kafka-python==2.0.2
+nltk==3.8.1
+gunicorn==21.2.0
+requests==2.31.0 

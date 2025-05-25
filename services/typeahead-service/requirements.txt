@@ -1,0 +1,5 @@
+flask==2.3.3
+psycopg2-binary==2.9.7
+redis==5.0.1
+pygtrie==2.5.0
+gunicorn==21.2.0 
