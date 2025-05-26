@@ -5,21 +5,45 @@ A scalable, distributed search engine built with microservices architecture, fea
 ## Architecture Overview
 
 ```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Data Sources  │───►│  Data Ingestion │───►│     Kafka       │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-                                                       │
-                                                       ▼
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   API Gateway   │◄───│  Search Engine  │◄───│ Indexing Shards │
-│ (Load Balancer) │    │    (Sharded)    │    │   (3 instances) │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-         │                       │                       │
-         ▼                       ▼                       ▼
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│ Typeahead Svc   │    │     Redis       │    │   PostgreSQL    │
-│  (2 shards)     │    │    (Cache)      │    │   (Storage)     │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
+Client
+   │
+   ▼
+┌───────────────┐
+│ API Gateway  │
+│ (8080)       │
+└─────┬─────────┘
+      │
+      ├─────────────┬─────────────────────────────┐
+      │             │                             │
+      ▼             ▼                             ▼
+┌───────────────┐ ┌──────────────────────────┐ ┌────────────────────┐
+│ Search Shard 0│ │ Typeahead Shard 0 (8011)│ │ Indexing Shard 0   │
+│   (8001)      │ │ Typeahead Shard 1 (8012)│ │   (8021)           │
+├───────────────┤ └──────────────────────────┘ ├────────────────────┤
+│ Search Shard 1│                             │ Indexing Shard 1   │
+│   (8002)      │                             │   (8022)           │
+├───────────────┤                             ├────────────────────┤
+│ Search Shard 2│                             │ Indexing Shard 2   │
+│   (8003)      │                             │   (8023)           │
+└───────────────┘                             └────────────────────┘
+      │
+      ▼
+┌───────────────┐
+│ PostgreSQL    │
+│ (per shard)   │
+└───────────────┘
+
+Other flows:
+- API Gateway caches search/typeahead results in Redis (not shown in search-service)
+- Indexing and Typeahead services use Redis for term frequency updates and autocomplete
+- Data Ingestion Service (8030) and Kafka are used for async document ingestion and distribution to indexing shards
+
+Key points:
+- API Gateway fans out search/typeahead requests to all shards in parallel, aggregates results
+- Search-service is sharded by document, not by word; each shard only knows its own docs
+- Only API Gateway uses Redis for search result caching
+- Search-service does NOT use Redis
+- Indexing/Typeahead services use Redis for term stats and autocomplete
 ```
 
 ## Services
@@ -421,6 +445,3 @@ wait
 python3 scripts/test_concurrency.py
 ```
 
-## License
-
-This project is licensed under the MIT License. # Elastisearch
